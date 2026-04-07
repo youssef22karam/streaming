@@ -312,24 +312,106 @@ class SherpaOfflineEngine(
 
         return when {
             modelInfo.modelType.contains("moonshine", ignoreCase = true) -> {
-                val pre = findFile(modelDir, mustContain = listOf("preprocess"), extensions = listOf(".onnx"))
-                    ?: findFile(modelDir, mustContain = listOf("preprocessor"), extensions = listOf(".onnx"))
-                    ?: return null
-                val enc = findFile(modelDir, mustContain = listOf("enc"), extensions = listOf(".onnx"))
-                    ?: return null
-                val uncached = findFile(modelDir, mustContain = listOf("uncached"), extensions = listOf(".onnx"))
-                    ?: return null
-                val cached = findFile(modelDir, mustContain = listOf("cached"), extensions = listOf(".onnx"))
-                    ?: return null
-                OfflineModelConfig(
-                    moonshine = com.k2fsa.sherpa.onnx.OfflineMoonshineModelConfig(
-                        preprocessor = pre.absolutePath,
-                        encoder = enc.absolutePath,
-                        uncachedDecoder = uncached.absolutePath,
-                        cachedDecoder = cached.absolutePath,
-                    ),
-                    tokens = tokens.absolutePath,
+                val moonExts = listOf(".onnx", ".ort")
+                val encoder = findFile(modelDir, mustContain = listOf("encoder"), extensions = moonExts)
+                    ?: findFile(modelDir, mustContain = listOf("encode"), extensions = moonExts)
+                    ?: findFile(modelDir, mustContain = listOf("enc"), extensions = moonExts)
+                    ?: run {
+                        Log.e(TAG, "Moonshine encoder file not found. Files: ${modelFilesSummary(modelDir)}")
+                        return null
+                    }
+
+                val mergedDecoder = findFile(
+                    modelDir,
+                    mustContain = listOf("decoder", "merged"),
+                    extensions = moonExts,
+                ) ?: findFile(
+                    modelDir,
+                    mustContain = listOf("merged"),
+                    extensions = moonExts,
                 )
+
+                if (mergedDecoder != null) {
+                    val moonshine = com.k2fsa.sherpa.onnx.OfflineMoonshineModelConfig(
+                        preprocessor = "",
+                        encoder = encoder.absolutePath,
+                        uncachedDecoder = "",
+                        cachedDecoder = "",
+                    )
+
+                    if (!setMoonshineMergedDecoder(moonshine, mergedDecoder.absolutePath)) {
+                        Log.e(
+                            TAG,
+                            "Moonshine merged decoder is unsupported by this sherpa runtime. Files: ${modelFilesSummary(modelDir)}",
+                        )
+                        return null
+                    }
+
+                    OfflineModelConfig(
+                        moonshine = moonshine,
+                        tokens = tokens.absolutePath,
+                    )
+                } else {
+                    val preprocessor = findFile(
+                        modelDir,
+                        mustContain = listOf("preprocessor"),
+                        extensions = moonExts,
+                    ) ?: findFile(
+                        modelDir,
+                        mustContain = listOf("preprocess"),
+                        extensions = moonExts,
+                    ) ?: run {
+                        Log.e(TAG, "Moonshine preprocessor file not found. Files: ${modelFilesSummary(modelDir)}")
+                        return null
+                    }
+
+                    val uncachedDecoder = findFile(
+                        modelDir,
+                        mustContain = listOf("uncached", "decoder"),
+                        extensions = moonExts,
+                    ) ?: findFile(
+                        modelDir,
+                        mustContain = listOf("uncached", "decode"),
+                        extensions = moonExts,
+                    ) ?: findFile(
+                        modelDir,
+                        mustContain = listOf("uncached"),
+                        extensions = moonExts,
+                    ) ?: run {
+                        Log.e(TAG, "Moonshine uncached decoder file not found. Files: ${modelFilesSummary(modelDir)}")
+                        return null
+                    }
+
+                    val cachedDecoder = findFile(
+                        modelDir,
+                        mustContain = listOf("cached", "decoder"),
+                        extensions = moonExts,
+                        mustNotContain = listOf("uncached"),
+                    ) ?: findFile(
+                        modelDir,
+                        mustContain = listOf("cached", "decode"),
+                        extensions = moonExts,
+                        mustNotContain = listOf("uncached"),
+                    ) ?: findFile(
+                        modelDir,
+                        mustContain = listOf("cached"),
+                        extensions = moonExts,
+                        mustNotContain = listOf("uncached"),
+                    ) ?: run {
+                        Log.e(TAG, "Moonshine cached decoder file not found. Files: ${modelFilesSummary(modelDir)}")
+                        return null
+                    }
+
+                    OfflineModelConfig(
+                        moonshine = com.k2fsa.sherpa.onnx.OfflineMoonshineModelConfig(
+                            preprocessor = preprocessor.absolutePath,
+                            encoder = encoder.absolutePath,
+                            uncachedDecoder = uncachedDecoder.absolutePath,
+                            cachedDecoder = cachedDecoder.absolutePath,
+                        ),
+                        tokens = tokens.absolutePath,
+                    )
+                }
             }
 
             modelInfo.modelType.contains("nemo_transducer", ignoreCase = true) ||
@@ -478,12 +560,61 @@ class SherpaOfflineEngine(
             .map { it.trim() }
             .filter { it.isNotBlank() }
 
+    private fun setMoonshineMergedDecoder(
+        moonshine: com.k2fsa.sherpa.onnx.OfflineMoonshineModelConfig,
+        mergedDecoderPath: String,
+    ): Boolean {
+        val cls = moonshine.javaClass
+        return try {
+            val setter = cls.methods.firstOrNull {
+                it.parameterTypes.size == 1 &&
+                    it.name.equals("setMergedDecoder", ignoreCase = true)
+            }
+            if (setter != null) {
+                setter.invoke(moonshine, mergedDecoderPath)
+                return true
+            }
+
+            val field = cls.declaredFields.firstOrNull {
+                it.name.equals("mergedDecoder", ignoreCase = true) ||
+                    it.name.equals("merged_decoder", ignoreCase = true)
+            } ?: return false
+
+            field.isAccessible = true
+            field.set(moonshine, mergedDecoderPath)
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed setting moonshine merged decoder: ${t.message}", t)
+            false
+        }
+    }
+
+    private fun modelFilesSummary(modelDir: File): String {
+        return modelDir.walkTopDown()
+            .filter { it.isFile }
+            .map { file ->
+                file.absolutePath
+                    .removePrefix(modelDir.absolutePath)
+                    .trimStart('\\', '/')
+                    .replace('\\', '/')
+            }
+            .filter { path ->
+                path.endsWith(".onnx", ignoreCase = true) ||
+                    path.endsWith(".ort", ignoreCase = true) ||
+                    path.endsWith(".txt", ignoreCase = true)
+            }
+            .take(30)
+            .joinToString(", ")
+    }
+
     private fun findFile(
         root: File,
         mustContain: List<String>,
         extensions: List<String>,
+        mustNotContain: List<String> = emptyList(),
     ): File? {
         val normalizedContains = mustContain.map { it.lowercase() }
+        val normalizedExcludes = mustNotContain.map { it.lowercase() }
         val normalizedExts = extensions.map { it.lowercase() }
 
         return root.walkTopDown()
@@ -494,7 +625,8 @@ class SherpaOfflineEngine(
             }
             .firstOrNull { file ->
                 val path = file.absolutePath.lowercase().replace('\\', '/')
-                normalizedContains.all { path.contains(it) }
+                normalizedContains.all { path.contains(it) } &&
+                    normalizedExcludes.none { path.contains(it) }
             }
     }
 }
