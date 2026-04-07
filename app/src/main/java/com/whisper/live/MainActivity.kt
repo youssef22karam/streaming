@@ -31,6 +31,7 @@ import androidx.lifecycle.lifecycleScope
 import com.whisper.live.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
@@ -41,6 +42,8 @@ class MainActivity : AppCompatActivity() {
     private var phoneEngine: TranscriptionEngine = VoskEngine()
     private var audioRecorder: AudioRecorder? = null
     private var currentModel: ModelDownloader.ModelInfo? = null
+    private var currentModelPath: String? = null
+    private var phoneEngineInitialized: Boolean = false
 
     private var isMicRecording = false
     private var isPhoneCapturing = false
@@ -378,6 +381,8 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             val modelPath = modelDir.absolutePath
             releaseEngines()
+            currentModelPath = modelPath
+            phoneEngineInitialized = false
 
             val pairOk = withContext(Dispatchers.IO) {
                 if (model.engineType == ModelDownloader.EngineType.VOSK) {
@@ -391,19 +396,31 @@ class MainActivity : AppCompatActivity() {
                     phone.setLanguage(targetLang)
                     micEngine = mic
                     phoneEngine = phone
+                    phoneEngineInitialized = phoneOk
                     Pair(micOk, phoneOk)
                 } else {
                     VoskEngine.releaseSharedModel()
-                    val mic = createEngine(model)
-                    val phone = createEngine(model)
-                    val micOk = mic.initialize(modelPath)
-                    val phoneOk = phone.initialize(modelPath)
                     val targetLang = selectedLanguageForModel(model)
+                    val mic = createEngine(model)
+                    val micOk = mic.initialize(modelPath)
                     mic.setLanguage(targetLang)
-                    phone.setLanguage(targetLang)
                     micEngine = mic
-                    phoneEngine = phone
-                    Pair(micOk, phoneOk)
+
+                    if (model.engineType == ModelDownloader.EngineType.SHERPA_OFFLINE) {
+                        // Lazy-init phone engine for heavy offline models (e.g., Moonshine)
+                        // to avoid loading two full copies up front and failing initialization.
+                        phoneEngine = createEngine(model)
+                        phoneEngine.setLanguage(targetLang)
+                        phoneEngineInitialized = false
+                        Pair(micOk, micOk)
+                    } else {
+                        val phone = createEngine(model)
+                        val phoneOk = phone.initialize(modelPath)
+                        phone.setLanguage(targetLang)
+                        phoneEngine = phone
+                        phoneEngineInitialized = phoneOk
+                        Pair(micOk, phoneOk)
+                    }
                 }
             }
 
@@ -436,6 +453,8 @@ class MainActivity : AppCompatActivity() {
             phoneEngine.release()
         } catch (_: Exception) {
         }
+        phoneEngineInitialized = false
+        currentModelPath = null
     }
 
     private fun deleteModel(model: ModelDownloader.ModelInfo) {
@@ -653,6 +672,29 @@ class MainActivity : AppCompatActivity() {
         startActivityForResult(projectionManager.createScreenCaptureIntent(), REQUEST_PROJECTION)
     }
 
+    private fun ensurePhoneEngineReady(model: ModelDownloader.ModelInfo): Boolean {
+        if (model.engineType != ModelDownloader.EngineType.SHERPA_OFFLINE) return true
+        if (phoneEngineInitialized && phoneEngine.isReady) return true
+
+        val modelPath = currentModelPath ?: return false
+        val targetLang = selectedLanguageForModel(model)
+
+        return try {
+            val ok = runBlocking(Dispatchers.IO) {
+                if (phoneEngine.isReady) true else phoneEngine.initialize(modelPath)
+            }
+            if (ok) {
+                phoneEngine.setLanguage(targetLang)
+                phoneEngineInitialized = true
+                true
+            } else {
+                false
+            }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     private fun startPhoneCapture(resultCode: Int, data: Intent) {
         if (isPhoneCapturing) return
         if (currentModel == null) {
@@ -664,6 +706,18 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(
                 this,
                 "Loaded model does not support ${SettingsManager.selectedLanguage.uppercase()}",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        if (model.engineType == ModelDownloader.EngineType.SHERPA_OFFLINE && !phoneEngineInitialized) {
+            setStatus("Preparing phone capture model...", "#888888")
+        }
+        if (!ensurePhoneEngineReady(model)) {
+            setStatus("Failed to initialize phone capture model", "#FF4444")
+            Toast.makeText(
+                this,
+                "Failed to load phone capture model. Reload the model and try again.",
                 Toast.LENGTH_LONG,
             ).show()
             return
